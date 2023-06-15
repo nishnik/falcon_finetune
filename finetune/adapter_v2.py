@@ -25,24 +25,27 @@ from lit_parrot.adapter_v2 import (
 from lit_parrot.tokenizer import Tokenizer
 from lit_parrot.utils import lazy_load, check_valid_checkpoint_dir
 from scripts.prepare_alpaca import generate_prompt
-
-eval_interval = 600
-save_interval = 1000
+import tqdm
+eval_interval = 10
+save_interval = 20
 eval_iters = 100
 log_interval = 1
 devices = 1
 
 # Hyperparameters
-learning_rate = 9e-3
+learning_rate = 1e-5
 batch_size = 128 / devices
-micro_batch_size = 2  # set to 2 because this is fit into 12GB Vram
+micro_batch_size = 4  # set to 2 because this is fit into 12GB Vram
 gradient_accumulation_iters = batch_size // micro_batch_size
+print ("Grad accumulate iters: " , gradient_accumulation_iters)
 assert gradient_accumulation_iters > 0
 epoch_size = 50000  # train dataset size
 num_epochs = 5
 max_iters = num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.02
 warmup_iters = 2 * (epoch_size // micro_batch_size) // devices  # 2 epochs
+print ("Warm up iters: ", warmup_iters)
+print ("Max iters: ", max_iters)
 
 ds_config = {
     "train_micro_batch_size_per_gpu": micro_batch_size,
@@ -100,9 +103,14 @@ def main(
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     fabric.print(f"Number of trainable parameters: {num_params}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     model, optimizer = fabric.setup(model, optimizer)
-    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir)
+    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    val_loss = validate(fabric, model, val_data, tokenizer)
+    fabric.print(f"step : val loss {val_loss:.4f}")
+    fabric.barrier()
+    
+    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, tokenizer)
 
     # Save the final checkpoint at the end of training
     save_path = out_dir / "lit_model_adapter_finetuned.pth"
@@ -118,6 +126,7 @@ def train(
     val_data: np.ndarray,
     checkpoint_dir: Path,
     out_dir: Path,
+    tokenizer: Tokenizer
 ) -> None:
     """The training loop.
 
@@ -125,13 +134,11 @@ def train(
     """
     step_count = 0
 
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
-
     if fabric.device.type == "xla":
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()
-    for iter_num in range(max_iters):
+    for iter_num in tqdm.trange(max_iters):
         if step_count <= warmup_iters:
             # linear warmup
             lr = learning_rate * step_count / warmup_iters
@@ -140,7 +147,7 @@ def train(
 
         t0 = time.time()
 
-        input_ids, targets = get_batch(fabric, train_data)
+        input_ids, targets = get_batch(fabric, train_data, False, iter_num)
 
         with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
             logits = model(input_ids)
@@ -148,6 +155,7 @@ def train(
             fabric.backward(loss / gradient_accumulation_iters)
 
         if (iter_num + 1) % gradient_accumulation_iters == 0:
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             if fabric.device.type == "xla":
                 xm.mark_step()
@@ -158,6 +166,7 @@ def train(
                 val_loss = validate(fabric, model, val_data, tokenizer)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
+                L.pytorch.utilities.memory.garbage_collection_cuda()
 
             if step_count % save_interval == 0:
                 save_path = out_dir / f"iter-{iter_num:06d}.pth"
@@ -170,16 +179,21 @@ def train(
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
-            fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
-
+            fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms, free mem: {torch.cuda.mem_get_info()[0]/(1024*1024):.2f}")
+        if iter_num % 1000 == 0:
+            L.pytorch.utilities.memory.garbage_collection_cuda()
+            
+# def clear_memory():
+#     print ("torch.cuda.mem_get_info()"
+#     torch.cuda.get_device_properties(0).total_memory
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tokenizer: Tokenizer) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
-    for k in range(eval_iters):
-        input_ids, targets = get_batch(fabric, val_data)
+    for k in tqdm.trange(eval_iters):
+        input_ids, targets = get_batch(fabric, val_data, True, k)
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
         losses[k] = loss.item()
@@ -213,8 +227,11 @@ def loss_fn(logits, targets):
     return loss
 
 
-def get_batch(fabric: L.Fabric, data: list):
-    ix = torch.randint(len(data), (micro_batch_size,))
+def get_batch(fabric: L.Fabric, data: list, deterministic: bool, iter_num: int = 0):
+    if deterministic:
+        ix = torch.arange(iter_num*micro_batch_size, (iter_num + 1)*micro_batch_size)
+    else:
+        ix = torch.randint(len(data), (micro_batch_size,))
 
     input_ids = [data[i]["input_ids"].type(torch.int64) for i in ix]
     labels = [data[i]["labels"].type(torch.int64) for i in ix]
