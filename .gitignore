@@ -12,3 +12,5 @@ wandb
 
 tests/original_falcon_40b.py
 *.ipynb_checkpoints*
+deployment.log
+*.csv
