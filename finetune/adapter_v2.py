@@ -11,6 +11,7 @@ import lightning as L
 import numpy as np
 import torch
 from lightning.fabric.strategies import DeepSpeedStrategy, XLAStrategy
+import logging
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -27,25 +28,36 @@ from lit_parrot.tokenizer import Tokenizer
 from lit_parrot.utils import lazy_load, check_valid_checkpoint_dir
 from scripts.prepare_alpaca import generate_prompt
 import tqdm
-eval_interval = 10
-save_interval = 20
-eval_iters = 100
-log_interval = 1
+
+logging.basicConfig(
+    filename='deployment.log',
+    format='%(asctime)s %(levelname)-8s %(filename)s:%(lineno)s - %(funcName)20s() : %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
+
+
+
+log_interval = 100
 devices = 1
 
 # Hyperparameters
 learning_rate = 9e-3
 # warmup_learning_rate = learning_rate * 0.01
 batch_size = 128 / devices
-micro_batch_size = 2  # set to 2 because this is fit into 12GB Vram
+micro_batch_size = 4  # set to 2 because this is fit into 12GB Vram
+eval_iters = 2000 // micro_batch_size
 gradient_accumulation_iters = batch_size // micro_batch_size
 print ("Grad accumulate iters: " , gradient_accumulation_iters)
 assert gradient_accumulation_iters > 0
-epoch_size = 50000  # train dataset size
+eval_interval = 2000 // gradient_accumulation_iters
+save_interval = 2 * (2000 // gradient_accumulation_iters)
+
+
+epoch_size = 20392  # train dataset size
 num_epochs = 5
 max_iters = num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.02
-warmup_iters = 1 * (epoch_size // micro_batch_size) // devices  # 2 epochs
+warmup_iters = int(0.3 * (epoch_size // micro_batch_size) // devices)  # 2 epochs
 print ("Warm up iters: ", warmup_iters)
 print ("Max iters: ", max_iters)
 
@@ -90,7 +102,6 @@ def main(
 
     train_data = torch.load(data_dir / "train.pt")
     val_data = torch.load(data_dir / "test.pt")
-
     config = Config.from_name(name=checkpoint_dir.name)
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
@@ -112,9 +123,10 @@ def main(
     with open(data_dir / "config.json") as data_config_path:
         max_seq_length = json.load(data_config_path).get("max_seq_length", model.config.block_size)
 
-    # val_loss = validate(fabric, model, val_data, tokenizer, max_seq_length)
-    # fabric.print(f"step : val loss {val_loss:.4f}")
-    # fabric.barrier()
+    val_loss = validate(fabric, model, val_data, tokenizer, max_seq_length)
+    fabric.print(f"step : val loss {val_loss:.4f}")
+    logging.info(f"step : val loss {val_loss:.4f}")
+    fabric.barrier()
 
     train_time = time.time()
     train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, tokenizer, max_seq_length)
@@ -155,7 +167,7 @@ def train(
 
         t0 = time.time()
 
-        input_ids, targets = get_batch(fabric, train_data, max_seq_length, True, iter_num)
+        input_ids, targets = get_batch(fabric, train_data, max_seq_length, False, iter_num)
 
         with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
             logits = model(input_ids, max_seq_length=max_seq_length)
@@ -210,7 +222,8 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tok
     val_loss = losses.mean()
 
     # produce an example:
-    instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
+    # instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
+    instruction = "Write a TextBlaze snippet that calculates the percentage change in stock price given the old price and the new price."
     fabric.print(instruction)
     sample = {"instruction": instruction, "input": ""}
     prompt = generate_prompt(sample)
