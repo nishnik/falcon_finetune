@@ -23,6 +23,7 @@ IGNORE_INDEX = -1
 MASK_INPUTS = False  # as in alpaca-lora
 SEED = 42
 MAX_LENGTH = 0  # useful to know the minimum max_seq_length during fine-tuning (saves memory!)
+CUTOFF_SEQ_LENGTH = 800
 
 
 def prepare(
@@ -37,7 +38,6 @@ def prepare(
 ) -> None:
     """Prepare the Alpaca dataset for instruction tuning.
 
-    The output is a training and validation dataset saved as `train.pt` and `val.pt`,
     which stores the preprocessed and tokenized prompts and labels.
     """
     with open(checkpoint_dir / "lit_config.json", "r") as file:
@@ -65,31 +65,44 @@ def prepare(
     print(f"val has {len(test_set):,} samples")
 
     print("Processing train split ...")
-    train_set = [
-        prepare_sample(
+    train_set_processed = []
+    test_set_processed = []
+    discared_samples_due_to_cutoff_length = 0
+    for sample in tqdm(train_set):
+        sample = prepare_sample(
             example=sample,
             tokenizer=tokenizer,
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
         )
-        for sample in tqdm(train_set)
-    ]
-    torch.save(train_set, destination_path / "train.pt")
+        if len(sample["input_ids"]) > CUTOFF_SEQ_LENGTH:
+            discared_samples_due_to_cutoff_length += 1
+            continue
+        
+        train_set_processed.append(sample)
+
+    torch.save(train_set_processed, destination_path / "train.pt")
 
     print("Processing test split ...")
-    test_set = [
-        prepare_sample(
+    
+    for sample in tqdm(test_set):
+        sample = prepare_sample(
             example=sample,
             tokenizer=tokenizer,
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
         )
-        for sample in tqdm(test_set)
-    ]
-    torch.save(test_set, destination_path / "test.pt")
-
+        if len(sample["input_ids"]) > CUTOFF_SEQ_LENGTH:
+            discared_samples_due_to_cutoff_length += 1
+            continue
+        test_set_processed.append(sample)
+    global MAX_LENGTH
+    torch.save(test_set_processed, destination_path / "test.pt")
+    if MAX_LENGTH > CUTOFF_SEQ_LENGTH:
+        MAX_LENGTH = CUTOFF_SEQ_LENGTH
+    print ("Discarded sample due to cutoff length", discared_samples_due_to_cutoff_length)
     with open(destination_path / "config.json", "w") as file:
         json.dump({"max_seq_length": MAX_LENGTH}, file)
 
